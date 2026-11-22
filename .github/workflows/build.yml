@@ -20,7 +20,7 @@ on:
       job:
         description: Run only this job (a manual dispatch only; a push always builds everything)
         type: choice
-        options: [all, linux-amd64, win-amd64, uwp-amd64, android-arm64, macos-arm64, lobby-server, mods]
+        options: [all, linux-amd64, linux-arm64, win-amd64, uwp-amd64, android-arm64, macos-arm64, lobby-server, mods]
         default: all
 
 permissions:
@@ -168,6 +168,140 @@ jobs:
         with:
           name: burnout-revenge-installer-linux-amd64
           path: rexglue/installer/Burnout_Revenge_Installer-x86_64.AppImage
+          retention-days: 7
+          if-no-files-found: error
+
+  # Linux on arm64 (Odin 3, Raspberry Pi, Apple silicon under Linux, etc.):
+  # scripts/platform.sh now picks linux-arm64 on aarch64, so the same build
+  # scripts run here as on linux-amd64 without further changes. linuxdeploy
+  # has native aarch64 AppImage tools, so the installer is built the same way.
+  linux-arm64:
+    if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'linux-arm64'
+    runs-on: ubuntu-24.04-arm
+    env:
+      CC: clang
+      CXX: clang++
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: etcpak
+        run: git submodule update --init --depth 1 rexglue/thirdparty/etcpak
+
+      - name: Install clang 20
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+          sudo apt-get install -y clang-20 lld-20
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 200
+
+      - name: Install build dependencies
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config git curl unzip zip autoconf \
+            vulkan-sdk \
+            libgtk-3-dev libx11-dev libx11-xcb-dev libxcb1-dev libxss-dev \
+            libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev libdecor-0-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            qt6-base-dev qt6-base-dev-tools qt6-wayland qt6-wayland-dev libfuse2t64
+
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1.2.22
+        with:
+          variant: sccache
+          key: linux-arm64
+
+      - name: Fetch the build inputs (private)
+        env:
+          ASSETS_TOKEN: ${{ secrets.ASSETS_TOKEN }}
+        run: |
+          if [ -z "$ASSETS_TOKEN" ]; then
+            echo "::error::ASSETS_TOKEN is not set"; exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${ASSETS_TOKEN}@github.com/shipa-2/xerenge-assets.git" "$RUNNER_TEMP/assets"
+          git -C "$RUNNER_TEMP/assets" remote set-url origin https://github.com/shipa-2/xerenge-assets.git
+          # Older assets keep the European files in game/ rather than game_eu/.
+          [ -d "$RUNNER_TEMP/assets/game_eu" ] || mv "$RUNNER_TEMP/assets/game" "$RUNNER_TEMP/assets/game_eu"
+          ls -la "$RUNNER_TEMP/assets/game_eu" "$RUNNER_TEMP/assets/game_eu/graphics"
+
+      - name: Resolve SDK/plume/XenosRecomp commits
+        id: pins
+        run: |
+          echo "sdk=$(git ls-remote https://github.com/shipa-2/rexglue-xerenge.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "plume=$(git ls-remote https://github.com/shipa-2/plume-xerenge.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "xenos=$(git ls-remote https://github.com/shipa-2/XenosRecomp-xerenge.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the SDK checkout and build
+        uses: actions/cache@v4
+        with:
+          path: rexglue-sdk
+          key: sdk-linux-arm64-${{ steps.pins.outputs.sdk }}
+
+      - name: SDK
+        run: ./scripts/setup-sdk.sh
+
+      - name: Cache plume and XenosRecomp
+        uses: actions/cache@v4
+        with:
+          path: |
+            plume
+            XenosRecomp
+          key: deps-linux-arm64-${{ steps.pins.outputs.plume }}-${{ steps.pins.outputs.xenos }}
+
+      - name: plume and XenosRecomp
+        run: ./scripts/setup-deps.sh
+
+      - name: Build the game
+        run: ./scripts/build.sh --game "$RUNNER_TEMP/assets/game_eu"
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Payload
+        run: |
+          payload="$RUNNER_TEMP/payload"
+          mkdir -p "$payload/bin" "$payload/tools"
+          cp rexglue/build/burnout "$payload/bin/burnout_eu"
+          find rexglue/build rexglue-sdk/out/linux-arm64 -maxdepth 2 -name '*.so*' -not -path '*/Debug/*' -exec cp -a {} "$payload/bin/" \;
+          cp rexglue/plume_pipelines.txt "$payload/bin/"  # the pipelines met playing it through: made during the logos
+          # The launcher (launcher.cpp), beside the game once installed.
+          c++ -std=c++17 -O2 rexglue/installer/launcher.cpp -o "$payload/burnout_revenge"
+          cp tools/bin/extract-image "$payload/tools/"
+          ls -laR "$payload"
+
+      - name: Build the game for the American release
+        run: |
+          if [ ! -f "$RUNNER_TEMP/assets/game_us/default.xex" ]; then
+            echo "::warning::the assets have no game_us/: this installer carries the European build only"
+            exit 0
+          fi
+          ./scripts/build.sh --game "$RUNNER_TEMP/assets/game_us"
+          cp rexglue/build/burnout "$RUNNER_TEMP/payload/bin/burnout_us"
+
+      - name: Installer AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/linuxdeploy"
+          cd "$RUNNER_TEMP/linuxdeploy"
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-aarch64.AppImage -O linuxdeploy
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-aarch64.AppImage -O linuxdeploy-plugin-qt
+          chmod +x linuxdeploy linuxdeploy-plugin-qt
+          export PATH="$PWD:$PATH"
+          cd "$GITHUB_WORKSPACE"
+          XERENGE_PAYLOAD="$RUNNER_TEMP/payload" QMAKE=$(command -v qmake6) ./rexglue/installer/make-appimage.sh
+          ls -la rexglue/installer/*.AppImage
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: burnout-revenge-installer-linux-arm64
+          path: rexglue/installer/Burnout_Revenge_Installer-aarch64.AppImage
           retention-days: 7
           if-no-files-found: error
 
@@ -780,7 +914,7 @@ jobs:
   # that raises VERSION publishes the installers as the
   # latest release.
   release:
-    needs: [linux-amd64, win-amd64, android-arm64, macos-arm64, lobby-server, mods]
+    needs: [linux-amd64, linux-arm64, win-amd64, android-arm64, macos-arm64, lobby-server, mods]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
@@ -851,6 +985,7 @@ jobs:
           gh release create "v$VERSION" --title "$VERSION" --latest --target "$GITHUB_SHA" \
             --notes-file notes.md \
             artifacts/Burnout_Revenge_Installer-x86_64.AppImage \
+            artifacts/Burnout_Revenge_Installer-aarch64.AppImage \
             artifacts/Burnout_Revenge_Installer-win-amd64.exe \
             artifacts/Burnout_Revenge-android-arm64.apk \
             artifacts/Burnout_Revenge_Installer-macos-arm64.zip \

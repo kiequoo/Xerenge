@@ -25,8 +25,11 @@ case "$(uname -s)" in
         ;;
     *)
         XR_OS=linux
-        XR_PRESET=linux-amd64
         XR_EXE=
+        case "$(uname -m)" in
+            aarch64|arm64) XR_PRESET=linux-arm64 ;;
+            *) XR_PRESET=linux-amd64 ;;
+        esac
         ;;
 esac
 # XR_JOBS may be set to fewer: the generated code is large, and a machine with

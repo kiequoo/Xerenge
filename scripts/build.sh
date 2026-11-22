@@ -124,8 +124,8 @@ if [ "$XR_OS" = windows ]; then
     generator="-G Ninja"
 fi
 march=-march=x86-64-v2
-if [ "$XR_PRESET" = mac-arm64 ]; then
-    # The SDK's mac-arm64 preset builds for this baseline as well.
+if [ "$XR_PRESET" = mac-arm64 ] || [ "$XR_PRESET" = linux-arm64 ]; then
+    # The SDK's arm64 presets build for this baseline as well.
     march=-march=armv8-a
 fi
 cmake -S "$project" -B "$project/build" $generator \
